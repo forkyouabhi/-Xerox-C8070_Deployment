@@ -1,0 +1,14 @@
+{
+  "driverName": "Xerox AltaLink C8070 PCL6",
+  "taskName": "Xerox_SecurePrint_Enforcement_C8070",
+  "persistDir": "NWMO\\Printers",
+  "deployDir": "NWMO\\Printers\\Deploy",
+  "eventSource": "XeroxC8070Deploy",
+  "printers": [
+    { "Name": "3FL Xerox C8070 LAN Room_MCE",       "IP": "192.168.107.8"  },
+    { "Name": "3FL Xerox C8070 IT Storage_MCE",      "IP": "192.168.107.7"  },
+    { "Name": "22_4FL Xerox C8070 Copy Room_MCE",    "IP": "192.168.107.6"  },
+    { "Name": "22_4FL Xerox C8070 Supply Room_MCE",  "IP": "192.168.107.5"  },
+    { "Name": "2_4FL Xerox C8070 LAN Room_MCE",      "IP": "192.168.107.10" }
+  ]
+}

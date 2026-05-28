@@ -5,10 +5,10 @@
   "deployDir": "NWMO\\Printers\\Deploy",
   "eventSource": "XeroxC8070Deploy",
   "printers": [
-    { "Name": "3FL Xerox C8070 LAN Room_MCE",       "IP": "192.168.107.8"  },
-    { "Name": "3FL Xerox C8070 IT Storage_MCE",      "IP": "192.168.107.7"  },
-    { "Name": "22_4FL Xerox C8070 Copy Room_MCE",    "IP": "192.168.107.6"  },
-    { "Name": "22_4FL Xerox C8070 Supply Room_MCE",  "IP": "192.168.107.5"  },
-    { "Name": "2_4FL Xerox C8070 LAN Room_MCE",      "IP": "192.168.107.10" }
+    { "Name": "3FL Xerox C8070 LAN Room",       "IP": "192.168.107.8"  },
+    { "Name": "3FL Xerox C8070 IT Storage",      "IP": "192.168.107.7"  },
+    { "Name": "22_4FL Xerox C8070 Copy Room",    "IP": "192.168.107.6"  },
+    { "Name": "22_4FL Xerox C8070 Supply Room",  "IP": "192.168.107.5"  },
+    { "Name": "74_Victoria_10FL Xerox C8070",      "IP": "10.74.201.21" }
   ]
 }

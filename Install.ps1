@@ -1,19 +1,15 @@
 #Requires -RunAsAdministrator
 # ============================================================
 # XEROX C8070 UNIFIED MASTER DEPLOYMENT SCRIPT
-# Version    : 3.1 (MEC-Hardened - Scorched Earth Edition)
-# Context    : SYSTEM via ManageEngine Endpoint Central
-# Idempotent : YES - safe to re-run at any cadence
+# Version    : 4.0.9 (The PnP Assassin - Final UI Ghost Fix)
+# Context    : SYSTEM/Admin via ManageEngine Endpoint Central
+# Impact     : Obliterates ALL C8070 ghosts across OS & User Hives
 # ============================================================
 $ErrorActionPreference = "Stop"
 
 # ============================================================
 # PATH CONSTANTS & LOGGING SETUP
 # ============================================================
-
-# FIX #1: Reliable source path resolution for MEC SYSTEM context.
-# $PSScriptRoot is empty when MEC launches scripts via cmd wrapper.
-# $MyInvocation.MyCommand.Path is the only reliable source in all contexts.
 if (-not [string]::IsNullOrEmpty($PSScriptRoot)) {
     $sourceDir = $PSScriptRoot
 } elseif (-not [string]::IsNullOrEmpty($MyInvocation.MyCommand.Path)) {
@@ -44,8 +40,87 @@ function Write-Log {
     Add-Content -Path $logPath -Value $line -ErrorAction SilentlyContinue
 }
 
+# ============================================================
+# HELPER: Scrub one loaded user hive path
+# ============================================================
+function Remove-PrinterFromUserHive {
+    param([string]$HivePSPath)
+
+    $rundllExe = "$env:windir\System32\rundll32.exe"
+    if (Test-Path "$env:windir\sysnative\rundll32.exe") {
+        $rundllExe = "$env:windir\sysnative\rundll32.exe"
+    }
+
+    # --- Devices and PrinterPorts ---
+    foreach ($subkey in @("Software\Microsoft\Windows NT\CurrentVersion\Devices",
+                          "Software\Microsoft\Windows NT\CurrentVersion\PrinterPorts")) {
+        $fullPath = "$HivePSPath\$subkey"
+        if (Test-Path $fullPath) {
+            $props = Get-ItemProperty $fullPath -ErrorAction SilentlyContinue
+            if ($props) {
+                $props | Get-Member -MemberType NoteProperty -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "C8070" -or $_.Name -match "_v1" } |
+                    ForEach-Object {
+                        Write-Log "    Removing user hive value [$subkey]: $($_.Name)" WARN
+                        Remove-ItemProperty -Path $fullPath -Name $_.Name -Force -ErrorAction SilentlyContinue
+                    }
+            }
+        }
+    }
+
+    # --- Printers\Connections ---
+    $connPath = "$HivePSPath\Printers\Connections"
+    if (Test-Path $connPath) {
+        Get-ChildItem -Path $connPath -ErrorAction SilentlyContinue | ForEach-Object {
+            $keyName = $_.PSChildName
+            $keyProps = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+
+            $isC8070 = ($keyName -match "C8070" -or $keyName -match "_v1") -or
+                       ($keyProps.PrinterName -match "C8070" -or $keyProps.PrinterName -match "_v1") -or
+                       ($keyProps.'(default)' -match "C8070")
+
+            if ($isC8070) {
+                Write-Log "    Removing user Connections key: $keyName" WARN
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+
+                if ($keyName -match "^,,(.+),(.+)$") {
+                    $uncName = "\\$($Matches[1])\$($Matches[2])"
+                    Write-Log "    printui /dn for UNC: $uncName" WARN
+                    $killArgs = "printui.dll,PrintUIEntry /dn /n `"$uncName`" /q"
+                    Start-Process $rundllExe -ArgumentList $killArgs -Wait -NoNewWindow -ErrorAction SilentlyContinue
+                } elseif ($keyProps.PrinterName) {
+                    Write-Log "    printui /dn for: $($keyProps.PrinterName)" WARN
+                    $killArgs = "printui.dll,PrintUIEntry /dn /n `"$($keyProps.PrinterName)`" /q"
+                    Start-Process $rundllExe -ArgumentList $killArgs -Wait -NoNewWindow -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    # --- Printers\Settings (Windows 11 UI Cache) ---
+    $settingsPath = "$HivePSPath\Printers\Settings"
+    if (Test-Path $settingsPath) {
+        Get-ChildItem -Path $settingsPath -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.PSChildName -match "C8070" -or $_.PSChildName -match "_v1") {
+                Write-Log "    Removing user Settings key: $($_.PSChildName)" WARN
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # --- User-level printer queue subkeys ---
+    $userPrinterPath = "$HivePSPath\Software\Microsoft\Windows NT\CurrentVersion\Windows"
+    if (Test-Path $userPrinterPath) {
+        $props = Get-ItemProperty $userPrinterPath -ErrorAction SilentlyContinue
+        if ($props.Device -match "C8070" -or $props.Device -match "_v1") {
+            Write-Log "    Clearing default printer Device value (matched C8070 or _v1)" WARN
+            Remove-ItemProperty -Path $userPrinterPath -Name "Device" -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Write-Log "==========================================================" STEP
-Write-Log "Xerox C8070 Unified MEC Deployment v3.1 - START"          STEP
+Write-Log "Xerox C8070 Unified MEC Deployment v4.0.9 - START"        STEP
 Write-Log "Source dir : $sourceDir"                                  INFO
 Write-Log "Deploy dir : $deployDir"                                  INFO
 Write-Log "Log file   : $logPath"                                    INFO
@@ -54,14 +129,20 @@ Write-Log "==========================================================" STEP
 
 # ============================================================
 # PHASE 00: STAGE FILES
-# Copies files from MEC's temporary extraction folder to ProgramData
-# so they persist after MEC cleans up the temp directory.
 # ============================================================
 Write-Log "PHASE 00: Staging deployment files..." STEP
 try {
-    if (-not (Test-Path $deployDir)) {
-        New-Item -ItemType Directory -Path $deployDir -Force | Out-Null
+    if (-not (Test-Path $sourceDir)) {
+        Write-Log "FATAL: Source directory does not exist: $sourceDir" ERROR
+        exit 1
     }
+    $sourceFiles = Get-ChildItem -Path $sourceDir -ErrorAction SilentlyContinue
+    if (-not $sourceFiles) {
+        Write-Log "FATAL: Source directory is empty: $sourceDir" ERROR
+        exit 1
+    }
+    Write-Log "  Source has $($sourceFiles.Count) items" INFO
+    if (-not (Test-Path $deployDir)) { New-Item -ItemType Directory -Path $deployDir -Force | Out-Null }
     Copy-Item -Path "$sourceDir\*" -Destination $deployDir -Recurse -Force -ErrorAction Stop
     Write-Log "  Files staged: $sourceDir -> $deployDir" OK
 } catch {
@@ -76,9 +157,8 @@ Write-Log "PHASE 0: Validating environment..." STEP
 try {
     $requiredFiles = @($configPath, $datPath, $binPath, $infPath)
     foreach ($f in $requiredFiles) {
-        if (Test-Path $f) {
-            Write-Log "  [FOUND]   $f" OK
-        } else {
+        if (Test-Path $f) { Write-Log "  [FOUND]   $f" OK }
+        else {
             Write-Log "FATAL: Required file missing after staging: $f" ERROR
             exit 1
         }
@@ -114,81 +194,232 @@ try {
 }
 
 # ============================================================
-# PHASE 1: AGGRESSIVE QUEUE SANITIZATION (SCORCHED EARTH)
+# PHASE 1: THE TOTAL ECLIPSE (BURN ALL C8070 DEVICES)
 # ============================================================
-Write-Log "PHASE 1: Aggressively sanitizing legacy and dirty queues..." STEP
+Write-Log "PHASE 1: Aggressively sanitizing ALL OS-Level C8070 traces..." STEP
 try {
-    # Extract just the exact names we WANT to keep eventually
-    $approvedNames = $printers | Select-Object -ExpandProperty Name
+    Stop-Process -Name SystemSettings -Force -ErrorAction SilentlyContinue
 
-    # 1. Obliterate ANY printer with "C8070" that doesn't perfectly match our final list
-    # This catches _v1, _MCE, typos, and old tests on ANY port.
-    Get-Printer -ErrorAction SilentlyContinue | Where-Object { 
-        $_.Name -match "C8070" -and $_.Name -notin $approvedNames 
-    } | ForEach-Object {
-        Write-Log "  Removing unauthorized/old test queue: $($_.Name)" WARN
-        Remove-Printer -Name $_.Name -ErrorAction SilentlyContinue
-        
-        # Native bypass kill just in case WMI fails on a ghost queue
-        $killArgs = "printui.dll,PrintUIEntry /dl /n `"$($_.Name)`" /q"
-        Start-Process "$env:windir\System32\rundll32.exe" -ArgumentList $killArgs -Wait -NoNewWindow
+    Write-Log "  Purging V4 Print Support Appx packages..." INFO
+    Get-AppxPackage -AllUsers *Xerox* -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+    Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match "Xerox" } |
+        Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+
+    Write-Log "  Removing V4 PS Drivers (all known names)..." INFO
+    foreach ($oldDriver in @("Xerox AltaLink C8070 V4 PS", "Xerox AltaLink C8070 V4 PCL6", "Xerox AltaLink C8070 PS")) {
+        Remove-PrinterDriver -Name $oldDriver -ErrorAction SilentlyContinue
     }
 
-    # 2. Remove the existing exact matches so Phase 5 builds them completely fresh
-    foreach ($p in $printers) {
-        if (Get-Printer -Name $p.Name -ErrorAction SilentlyContinue) {
-            Write-Log "  Removing existing approved queue to rebuild fresh: $($p.Name)" INFO
-            Remove-Printer -Name $p.Name -ErrorAction SilentlyContinue
-            
-            # Native bypass kill for approved queues too, ensuring no ghosts
-            $killArgs = "printui.dll,PrintUIEntry /dl /n `"$($p.Name)`" /q"
-            Start-Process "$env:windir\System32\rundll32.exe" -ArgumentList $killArgs -Wait -NoNewWindow
+    # ========================================================
+    # FIX: Native PnP Device Assassination (Bypass Print Spooler)
+    # ========================================================
+    Write-Log "  Hunting ALL PnP and SoftwareDevice ghosts..." INFO
+    $pnpExe = "$env:windir\System32\pnputil.exe"
+    if (Test-Path "$env:windir\sysnative\pnputil.exe") { $pnpExe = "$env:windir\sysnative\pnputil.exe" }
+
+    $ghostDevices = Get-PnpDevice -Class PrintQueue -ErrorAction SilentlyContinue | Where-Object { 
+        $_.FriendlyName -match "C8070" -or $_.FriendlyName -match "_v1" 
+    }
+    
+    if ($ghostDevices) {
+        foreach ($ghost in $ghostDevices) {
+            Write-Log "  Executing PnP hardware kill for: $($ghost.FriendlyName)" WARN
+            & $pnpExe /remove-device "$($ghost.InstanceId)" /device | Out-Null
         }
+    } else {
+        Write-Log "  No ghost PnP devices detected." OK
     }
 
-    # 3. Remove stale IP_ ports no longer in config
+    # Legacy Spooler Cleanup (just in case they survived the PnP purge)
+    Write-Log "  Removing all C8070 print queues from legacy spooler..." INFO
+    $rundllExe = "$env:windir\System32\rundll32.exe"
+    if (Test-Path "$env:windir\sysnative\rundll32.exe") { $rundllExe = "$env:windir\sysnative\rundll32.exe" }
+
+    Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "C8070" -or $_.Name -match "_v1" } | ForEach-Object {
+        Write-Log "  [Get-Printer] Removing queue: $($_.Name)" WARN
+        Remove-Printer -Name $_.Name -ErrorAction SilentlyContinue
+        $killArgs = "printui.dll,PrintUIEntry /dl /n `"$($_.Name)`" /q"
+        Start-Process $rundllExe -ArgumentList $killArgs -Wait -NoNewWindow -ErrorAction SilentlyContinue
+    }
+
+    Write-Log "  [WMI] Sweeping for driver-unavailable queues..." INFO
+    $wmiPrinters = Get-CimInstance -ClassName Win32_Printer -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match "C8070" -or $_.Name -match "_v1" }
+    foreach ($wp in $wmiPrinters) {
+        Write-Log "  [WMI] Removing: $($wp.Name)" WARN
+        Remove-CimInstance -InputObject $wp -ErrorAction SilentlyContinue
+        $killArgs = "printui.dll,PrintUIEntry /dl /n `"$($wp.Name)`" /q"
+        Start-Process $rundllExe -ArgumentList $killArgs -Wait -NoNewWindow -ErrorAction SilentlyContinue
+    }
+
     Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -like "IP_192.168.*" -and ($_.Name -notin $validPorts)
     } | ForEach-Object {
         Write-Log "  Removing stale port: $($_.Name)" WARN
         Remove-PrinterPort -Name $_.Name -ErrorAction SilentlyContinue
     }
+
 } catch {
     Write-Log "PHASE 1 FAILED: $_" ERROR
     exit 1
 }
 
 # ============================================================
-# PHASE 2: SPOOLER RESTART
-# FIX #4: Verify spooler actually starts before proceeding.
+# PHASE 2: SPOOLER RESTART & DEEP REGISTRY PURGE (INC. USER HIVES)
 # ============================================================
-Write-Log "PHASE 2: Cycling Print Spooler..." STEP
+Write-Log "PHASE 2: Cycling Print Spooler and Deep Registry Clean..." STEP
 try {
     Write-Log "  Stopping spooler..." INFO
     & sc.exe stop Spooler | Out-Null
-
-    # Wait up to 30s for stopped state
-    $timeout = 30
-    $elapsed = 0
+    $timeout = 30; $elapsed = 0
     while ((Get-Service Spooler).Status -ne "Stopped" -and $elapsed -lt $timeout) {
-        Start-Sleep -Seconds 2
-        $elapsed += 2
+        Start-Sleep -Seconds 2; $elapsed += 2
     }
     if ((Get-Service Spooler).Status -ne "Stopped") {
-        Write-Log "  Spooler didn't stop gracefully after ${timeout}s. Forcing." WARN
         Stop-Service Spooler -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
     }
     Write-Log "  Spooler stopped." OK
 
-    Write-Log "  Starting spooler..." INFO
-    & sc.exe start Spooler | Out-Null
+    Write-Log "  Purging running context user UI cache (HKCU)..." INFO
+    Remove-PrinterFromUserHive -HivePSPath "Registry::HKEY_CURRENT_USER"
 
-    # FIX #4: Verify spooler actually came back up before continuing
+    Write-Log "  Purging active user UI caches (HKEY_USERS - loaded hives)..." INFO
+    $loadedSids = @()
+    try {
+        $baseKey = [Microsoft.Win32.Registry]::Users
+        $loadedSids = $baseKey.GetSubKeyNames() | Where-Object { $_ -match "^S-1-5-21-" -and $_ -notmatch "_Classes" }
+    } catch {
+        Write-Log "  Warning: .NET Registry enumeration failed. $_" WARN
+    }
+
+    foreach ($sid in $loadedSids) {
+        Write-Log "  Processing loaded hive via SID: $sid" INFO
+        Remove-PrinterFromUserHive -HivePSPath "Registry::HKEY_USERS\$sid"
+    }
+
+    Write-Log "  Purging offline user hives (not currently loaded)..." INFO
+    $loadedUsernames = @()
+    foreach ($sidKey in $loadedSids) {
+        $profilePath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sidKey" -ErrorAction SilentlyContinue).ProfileImagePath
+        if ($profilePath) {
+            $loadedUsernames += (Split-Path $profilePath -Leaf).ToLower()
+        }
+    }
+    Write-Log "  Loaded hive usernames to skip: $($loadedUsernames -join ', ')" INFO
+
+    Get-ChildItem "C:\Users" -ErrorAction SilentlyContinue | ForEach-Object {
+        $profileDir  = $_.FullName
+        $folderName  = $_.Name.ToLower()
+        $ntuser      = Join-Path $profileDir "NTUSER.DAT"
+        if (-not (Test-Path $ntuser)) { return }
+
+        if ($folderName -in @("public","default","default user","all users")) { return }
+
+        if ($folderName -in $loadedUsernames) {
+            Write-Log "  Skipping $profileDir (username matches loaded hive - scrubbed above)" INFO
+            return
+        }
+
+        $sidProps = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" -ErrorAction SilentlyContinue | Where-Object { (Split-Path $_.ProfileImagePath -Leaf) -ieq $folderName -or $_.ProfileImagePath -ieq $profileDir }
+        $sid = $sidProps.PSChildName
+        
+        if ($sid -and ($sid -in $loadedSids)) {
+            Write-Log "  Skipping $profileDir (SID $sid is loaded)" INFO
+            return
+        }
+
+        $tempKey = "HKLM\NWMO_TempHive_$($_.Name)"
+        Write-Log "  Loading offline hive: $ntuser -> $tempKey" INFO
+        
+        $oldErrPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $regResult = & reg.exe load $tempKey $ntuser 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $oldErrPref
+
+        if ($exitCode -ne 0) {
+            Write-Log "  Could not load hive for $($_.Name) (locked/in-use). Skipping." WARN
+            return
+        }
+
+        try {
+            $hivePSPath = "Registry::$tempKey"
+            Remove-PrinterFromUserHive -HivePSPath $hivePSPath
+        } finally {
+            [gc]::Collect()
+            [gc]::WaitForPendingFinalizers()
+            Start-Sleep -Milliseconds 500
+            
+            $oldErrPref = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $unloadResult = & reg.exe unload $tempKey 2>&1
+            $exitCode = $LASTEXITCODE
+            $ErrorActionPreference = $oldErrPref
+
+            if ($exitCode -ne 0) {
+                Write-Log "  Warning: Could not unload hive $tempKey : $unloadResult" WARN
+            } else {
+                Write-Log "  Offline hive unloaded: $tempKey" OK
+            }
+        }
+    }
+
+    Write-Log "  Purging OS ghost queues from Print registry cache..." INFO
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers",
+        "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers"
+    )
+    foreach ($path in $regPaths) {
+        if (Test-Path $path) {
+            Get-ChildItem -Path $path -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -match "C8070" -or $_.PSChildName -match "_v1" } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # ========================================================
+    # FIX: DAF Target Enhancement
+    # ========================================================
+    Write-Log "  Purging Device Association Framework (Settings App UI Cache)..." INFO
+    $dafPath = "HKLM:\SOFTWARE\Microsoft\DeviceAssociationFramework\Store"
+    if (Test-Path $dafPath) {
+        Get-ChildItem -Path $dafPath -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $props = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if (($props.FriendlyName -match "C8070") -or ($props.System_ItemNameDisplay -match "C8070") -or ($props.FriendlyName -match "_v1") -or ($props.System_ItemNameDisplay -match "_v1")) {
+                Write-Log "  Removing DAF Ghost Entry: $($_.PSChildName)" INFO
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    Write-Log "  Purging Device Manager PRINTENUM cache..." INFO
+    $printEnum = "HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\PRINTENUM"
+    if (Test-Path $printEnum) {
+        Get-ChildItem -Path $printEnum -ErrorAction SilentlyContinue |
+            Where-Object {
+                $fn = (Get-ItemProperty $_.PSPath -Name "FriendlyName" -ErrorAction SilentlyContinue).FriendlyName
+                $fn -match "C8070" -or $fn -match "_v1"
+            } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Log "  Purging PRINTUI per-user settings cache..." INFO
+    $puiPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\PackageInstallation"
+    if (Test-Path $puiPath) {
+        Get-ChildItem -Path $puiPath -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match "C8070" -or $_.PSChildName -match "_v1" } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Log "  Starting spooler and resetting Device Association Service..." INFO
+    & sc.exe start Spooler | Out-Null
+    
+    # This forces the Settings App UI to dynamically drop the deleted devices
+    Restart-Service -Name "DeviceAssociationService" -Force -ErrorAction SilentlyContinue
+
     Start-Sleep -Seconds 5
-    $spoolerStatus = (Get-Service Spooler).Status
-    Write-Log "  Spooler status after start: $spoolerStatus" INFO
-    if ($spoolerStatus -ne "Running") {
+    if ((Get-Service Spooler).Status -ne "Running") {
         Write-Log "FATAL: Spooler failed to start. Cannot continue." ERROR
         exit 1
     }
@@ -199,28 +430,20 @@ try {
 }
 
 # ============================================================
-# PHASE 3: DRIVER STAGING AND INSTALLATION (WMI Bypass)
+# PHASE 3: DRIVER STAGING AND INSTALLATION
 # ============================================================
-Write-Log "PHASE 3: Staging Xerox PCL6 driver..." STEP
+Write-Log "PHASE 3: Staging Xerox V3 PCL6 driver..." STEP
 try {
-    # Bypass 32-bit MEC File System Redirector to find the true 64-bit pnputil.exe
     $pnpExe = "$env:windir\System32\pnputil.exe"
-    if (Test-Path "$env:windir\sysnative\pnputil.exe") { 
-        $pnpExe = "$env:windir\sysnative\pnputil.exe" 
-    }
-    
+    if (Test-Path "$env:windir\sysnative\pnputil.exe") { $pnpExe = "$env:windir\sysnative\pnputil.exe" }
+
     $pnpResult = & $pnpExe /add-driver $infPath /install 2>&1
     Write-Log "pnputil result: $pnpResult" INFO
 
     if (-not (Get-PrinterDriver -Name $driverName -ErrorAction SilentlyContinue)) {
         Write-Log "Registering driver via native PrintUI engine..." INFO
-        
-        # Ensure we use 64-bit rundll32 for the driver installation
         $rundllExe = "$env:windir\System32\rundll32.exe"
-        if (Test-Path "$env:windir\sysnative\rundll32.exe") { 
-            $rundllExe = "$env:windir\sysnative\rundll32.exe" 
-        }
-        
+        if (Test-Path "$env:windir\sysnative\rundll32.exe") { $rundllExe = "$env:windir\sysnative\rundll32.exe" }
         $printuiArgs = "printui.dll,PrintUIEntry /ia /m `"$driverName`" /h `"x64`" /f `"$infPath`""
         Start-Process $rundllExe -ArgumentList $printuiArgs -Wait -NoNewWindow
     } else {
@@ -257,11 +480,8 @@ try {
 # ============================================================
 Write-Log "PHASE 5: Building printer queues via native PrintUI engine..." STEP
 try {
-    # Bypass 32-bit MEC File System Redirector
     $rundllExe = "$env:windir\System32\rundll32.exe"
-    if (Test-Path "$env:windir\sysnative\rundll32.exe") { 
-        $rundllExe = "$env:windir\sysnative\rundll32.exe" 
-    }
+    if (Test-Path "$env:windir\sysnative\rundll32.exe") { $rundllExe = "$env:windir\sysnative\rundll32.exe" }
 
     foreach ($p in $printers) {
         $portName = "IP_$($p.IP)"
@@ -269,14 +489,9 @@ try {
 
         if (-not $existing) {
             Write-Log "Creating queue: $($p.Name) on $portName" INFO
-            
-            # /if = install via inf, /b = queue name, /f = inf path, /r = port, /m = driver name, /z = do not share
             $printuiArgs = "printui.dll,PrintUIEntry /if /b `"$($p.Name)`" /f `"$infPath`" /r `"$portName`" /m `"$driverName`" /z"
             Start-Process $rundllExe -ArgumentList $printuiArgs -Wait -NoNewWindow
-            
-            # Brief 3-second pause to let the spooler commit the new registry keys before Phase 6 checks for them
-            Start-Sleep -Seconds 3 
-            
+            Start-Sleep -Seconds 3
         } elseif ($existing.PortName -ne $portName) {
             Write-Log "Correcting port on $($p.Name): $($existing.PortName) -> $portName" WARN
             Set-Printer -Name $p.Name -PortName $portName -ErrorAction SilentlyContinue
@@ -291,9 +506,6 @@ try {
 
 # ============================================================
 # PHASE 6: HKLM DEVMODE INJECTION
-# FIX: Added retry loop - spooler writes the registry key
-#      asynchronously after queue creation; without a wait
-#      the key often doesn't exist yet and DevMode is silently skipped.
 # ============================================================
 Write-Log "PHASE 6: Injecting machine-level DevMode (HKLM)..." STEP
 try {
@@ -305,16 +517,12 @@ try {
 
         foreach ($p in $printers) {
             $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\$($p.Name)"
-
-            # FIX: Retry up to 5 times (15s total) for spooler to commit the key
-            $retries = 5
-            $found   = $false
+            $retries = 5; $found = $false
             for ($i = 1; $i -le $retries; $i++) {
                 if (Test-Path $regPath) { $found = $true; break }
                 Write-Log "  Waiting for registry key ($i/$retries): $($p.Name)" WARN
                 Start-Sleep -Seconds 3
             }
-
             if ($found) {
                 Set-ItemProperty -Path $regPath -Name "Default DevMode" -Value $devModeBytes -Type Binary -ErrorAction Stop
                 Write-Log "  DevMode injected: $($p.Name)" OK
@@ -330,10 +538,6 @@ try {
 
 # ============================================================
 # PHASE 7: PERSIST ENFORCEMENT SCRIPT + SCHEDULED TASK
-# FIX #5: RunLevel changed from Highest to Limited.
-#         BUILTIN\Users are standard users - Windows will silently
-#         refuse to run a Highest task for non-admins, meaning
-#         the per-logon .dat injection would never fire.
 # ============================================================
 Write-Log "PHASE 7: Persisting enforcement files and registering scheduled task..." STEP
 try {
@@ -345,9 +549,6 @@ try {
     }
 
     $enforceScriptPath = Join-Path $persistDir "Enforce-SecurePrint.ps1"
-
-    # This script runs as the logged-on standard user.
-    # printui.dll/PrintUIEntry does not require elevation - Limited is correct.
     $enforceScriptContent = @'
 $persistDir = "C:\ProgramData\NWMO\Printers"
 $configPath = Join-Path $persistDir "printers.json"
@@ -368,7 +569,6 @@ foreach ($p in $config.printers) {
     Set-Content -Path $enforceScriptPath -Value $enforceScriptContent -Encoding UTF8 -Force
     Write-Log "  Enforce-SecurePrint.ps1 written to: $enforceScriptPath" OK
 
-    # Remove existing task if present (idempotent re-run)
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Write-Log "  Existing scheduled task removed for re-registration: $taskName" WARN
@@ -377,10 +577,7 @@ foreach ($p in $config.printers) {
     $taskArgs  = "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$enforceScriptPath`""
     $action    = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $taskArgs
     $trigger   = New-ScheduledTaskTrigger -AtLogOn
-
-    # FIX #5: Limited (not Highest) - standard users cannot elevate for scheduled tasks.
     $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
-
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
     Write-Log "  Scheduled task registered: $taskName (RunLevel: Limited)" OK
 } catch {
@@ -401,7 +598,6 @@ try {
     $deviceInstallPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Settings"
     if (-not (Test-Path $deviceInstallPath)) { New-Item -Path $deviceInstallPath -Force | Out-Null }
     Set-ItemProperty -Path $deviceInstallPath -Name "DisableWindowsUpdateAccess" -Value 1 -Type DWord -Force
-
     Write-Log "  WSD suppression applied." OK
 } catch {
     Write-Log "  Phase 8 WARNING: WSD suppression failed (non-fatal). $_" WARN
@@ -425,7 +621,6 @@ try {
     Set-ItemProperty -Path $pnpPath -Name "InForest"                      -Value 0 -Type DWord  -Force
     Set-ItemProperty -Path $pnpPath -Name "NoWarningNoElevationOnInstall" -Value 0 -Type DWord  -Force
     Set-ItemProperty -Path $pnpPath -Name "UpdatePromptSettings"          -Value 0 -Type DWord  -Force
-
     Write-Log "  Spooler security hardening applied." OK
 } catch {
     Write-Log "  Phase 9 WARNING: Security hardening partially failed (non-fatal). $_" WARN
@@ -439,7 +634,7 @@ try {
     if (-not [System.Diagnostics.EventLog]::SourceExists($eventSource)) {
         New-EventLog -LogName Application -Source $eventSource -ErrorAction SilentlyContinue
     }
-    $msg = "XeroxC8070|DEPLOY_COMPLETE|Device=$env:COMPUTERNAME|Printers=$($printers.Count)|Script=v3.1"
+    $msg = "XeroxC8070|DEPLOY_COMPLETE|Device=$env:COMPUTERNAME|Printers=$($printers.Count)|Script=v4.0.9"
     Write-EventLog -LogName Application -Source $eventSource -EventId 1001 -EntryType Information -Message $msg
     Write-Log "  Event log entry written (Source: $eventSource, EventID: 1001)." OK
 } catch {
@@ -476,7 +671,7 @@ if ($allOk) {
 }
 Write-Log "Log saved to: $logPath" INFO
 Write-Log "==========================================================" STEP
-Write-Log "Xerox C8070 Unified MEC Deployment v3.1 - COMPLETE"        STEP
+Write-Log "Xerox C8070 Unified MEC Deployment v4.0.9 - COMPLETE"        STEP
 Write-Log "==========================================================" STEP
 
 exit 0
